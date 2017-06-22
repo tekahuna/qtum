@@ -521,8 +521,7 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
 
     // Check for negative or overflow output values
     CAmount nValueOut = 0;
-    for (const auto& txout : tx.vout)
-    {
+    for (const auto& txout : tx.vout) {
         if (txout.IsEmpty() && !tx.IsCoinBase() && !tx.IsCoinStake())
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-vout-empty");
         if (txout.nValue < 0)
@@ -533,11 +532,13 @@ bool CheckTransaction(const CTransaction& tx, CValidationState &state, bool fChe
         if (!MoneyRange(nValueOut))
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-txouttotal-toolarge");
 
-        /////////////////////////////////////////////////////////// // qtum
-        std::vector<valtype> vSolutions;
-        txnouttype whichType;
-        if (txout.scriptPubKey.HasOpCall() && !Solver(txout.scriptPubKey, whichType, vSolutions)){
-            return state.DoS(100, false, REJECT_INVALID, "bad-txns-callcontract-incorrect");
+        /////////////////////////////////////////////////////////// // qtuma
+        if (txout.scriptPubKey.HasOpCall() || txout.scriptPubKey.HasOpCreate()) {
+            std::vector<valtype> vSolutions;
+            txnouttype whichType;
+            if (!Solver(txout.scriptPubKey, whichType, vSolutions)) {
+                return state.DoS(100, false, REJECT_INVALID, "bad-txns-contract-nonstandard");
+            }
         }
         ///////////////////////////////////////////////////////////
     }
@@ -1949,27 +1950,46 @@ bool CheckRefund(const CBlock& block, const std::vector<CTxOut>& vouts){
     return true;
 }
 
-valtype GetSenderAddress(const CTransaction& tx, const CCoinsViewCache* coinsView){
-    CTransactionRef txPrevout;
-    uint256 hashBlock;
+valtype GetSenderAddress(const CTransaction& tx, const CCoinsViewCache* coinsView, const std::vector<CTransactionRef>* blockTxs){
     CScript script;
-    if(coinsView){
-        script = coinsView->AccessCoins(tx.vin[0].prevout.hash)->vout[tx.vin[0].prevout.n].scriptPubKey;    
-    } else {
+    bool scriptFilled=false; //can't use script.empty() because an empty script is technically valid
+
+    // First check the current (or in-progress) block for zero-confirmation change spending that won't yet be in txindex
+    if(blockTxs){
+        for(auto btx : *blockTxs){
+            if(btx->GetHash() == tx.vin[0].prevout.hash){
+                script = btx->vout[tx.vin[0].prevout.n].scriptPubKey;
+                scriptFilled=true;
+                break;
+            }
+        }
+    }
+    if(!scriptFilled && coinsView){
+        script = coinsView->AccessCoins(tx.vin[0].prevout.hash)->vout[tx.vin[0].prevout.n].scriptPubKey;
+        scriptFilled = true;
+    }
+    if(!scriptFilled)
+    {
+        CTransactionRef txPrevout;
+        uint256 hashBlock;
         if(GetTransaction(tx.vin[0].prevout.hash, txPrevout, Params().GetConsensus(), hashBlock, true)){
             script = txPrevout->vout[tx.vin[0].prevout.n].scriptPubKey;
         } else {
-            // TODO temp exeption   
+            LogPrintf("Error fetching transaction details of tx %s. This will probably cause more errors", tx.vin[0].prevout.hash.ToString());
             return valtype();
         }
     }
+
 	CTxDestination addressBit;
-	if(ExtractDestination(script, addressBit)){
-		if (addressBit.type() == typeid(CKeyID)){
+    txnouttype txType=TX_NONSTANDARD;
+	if(ExtractDestination(script, addressBit, &txType)){
+		if ((txType == TX_PUBKEY || txType == TX_PUBKEYHASH) &&
+                addressBit.type() == typeid(CKeyID)){
 			CKeyID senderAddress(boost::get<CKeyID>(addressBit));
 			return valtype(senderAddress.begin(), senderAddress.end());
 		}
 	}
+    //prevout is not a standard transaction format, so just return 0
     return valtype();
 }
 
@@ -2188,7 +2208,7 @@ QtumTransaction QtumTxConverter::createEthTX(const EthTransactionParams& etp, ui
     else{
         txEth = QtumTransaction(txBit.vout[nOut].nValue, etp.gasPrice, etp.gasLimit, etp.receiveAddress, etp.code, dev::u256(0));
     }
-    dev::Address sender(GetSenderAddress(txBit, view));
+    dev::Address sender(GetSenderAddress(txBit, view, blockTransactions));
     txEth.forceSender(sender);
     txEth.setHashWith(uintToh256(txBit.GetHash()));
     txEth.setNVout(nOut);
@@ -2405,7 +2425,8 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             dev::h256 oldHashQtumRoot(globalState->rootHashUTXO());
             dev::h256 oldHashStateRoot(globalState->rootHash());
 
-            QtumTxConverter convert(tx, NULL);
+            QtumTxConverter convert(tx, NULL, &block.vtx);
+
             std::vector<QtumTransaction> transactions = convert.extractionQtumTransactions();
             ByteCodeExec exec(block, transactions);
             exec.performByteCode();
@@ -2476,8 +2497,9 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     checkBlock.hashMerkleRoot = BlockMerkleRoot(checkBlock);
     checkBlock.hashStateRoot = h256Touint(globalState->rootHash());
     checkBlock.hashUTXORoot = h256Touint(globalState->rootHashUTXO());
+    //If this error happens, it probably means that something with AAL created transactions didn't match up to what is expected
     if((checkBlock.GetHash() != block.GetHash()) && !fJustCheck)
-        return state.DoS(100, error("ConnectBlock(): Incorrect transactions or hashes(hashStateRoot, hashUTXORoot)."),
+        return state.DoS(100, error("ConnectBlock(): Incorrect AAL transactions or hashes (hashStateRoot, hashUTXORoot)"),
                             REJECT_INVALID, "incorrect-transactions-or-hashes-block");
 
     if (fJustCheck)
@@ -3581,6 +3603,11 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
         if (block.vtx[i]->IsCoinBase())
             return state.DoS(100, false, REJECT_INVALID, "bad-cb-multiple", false, "more than one coinbase");
 
+    //Don't allow contract opcodes in coinbase
+    if(block.vtx[0]->HasOpSpend() || block.vtx[0]->HasCreateOrCall()){
+        return state.DoS(100, false, REJECT_INVALID, "bad-cb-contract", false, "coinbase must not contain OP_SPEND, OP_CALL, or OP_CREATE");
+    }
+
     // Second transaction must be coinbase in case of PoS block, the rest must not be
     if (block.IsProofOfStake())
     {
@@ -3601,17 +3628,33 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
             if (block.vtx[i]->IsCoinStake())
                return state.DoS(100, false, REJECT_INVALID, "bad-cs-multiple", false, "more than one coinstake");
 
+        //Don't allow contract opcodes in coinstake
+        //We might allow this later, but it hasn't been tested enough to determine if safe
+        if(block.vtx[1]->HasOpSpend() || block.vtx[1]->HasCreateOrCall()){
+            return state.DoS(100, false, REJECT_INVALID, "bad-cs-contract", false, "coinstake must not contain OP_SPEND, OP_CALL, or OP_CREATE");
+        }
     }
 
     // Check proof-of-stake block signature
     if (fCheckSig && !CheckBlockSignature(block))
         return state.DoS(100, false, REJECT_INVALID, "bad-blk-signature", false, "bad proof-of-stake block signature");
 
+    bool lastWasContract=false;
     // Check transactions
-    for (const auto& tx : block.vtx)
+    for (const auto& tx : block.vtx) {
         if (!CheckTransaction(*tx, state, false))
             return state.Invalid(false, state.GetRejectCode(), state.GetRejectReason(),
-                                 strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(), state.GetDebugMessage()));
+                                 strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(),
+                                           state.GetDebugMessage()));
+        //OP_SPEND can only exist immediately after a contract tx in a block
+        //So, if the previous tx was not a contract tx, fail it.
+        if(tx->HasOpSpend()){
+            if(!lastWasContract){
+                return state.DoS(100, false, REJECT_INVALID, "bad-opspend-tx", false, "OP_SPEND transaction without corresponding contract transaction");
+            }
+        }
+        lastWasContract = tx->HasCreateOrCall() && !tx->HasOpSpend();
+    }
 
     unsigned int nSigOps = 0;
     for (const auto& tx : block.vtx)
